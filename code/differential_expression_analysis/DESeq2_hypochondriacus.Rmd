@@ -1,0 +1,495 @@
+---
+title: "DESeq2_practive"
+author: "twinkle1"
+date: "1/21/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(DESeq2)
+library(factoextra)
+library(pheatmap)
+library(wesanderson)
+library(ggrepel)
+library(goseq)
+library(DEGreport)
+library(cowplot)
+knitr::opts_knit$set(root.dir = "/home/tom/Documents/projects/seed_color_differential_expression_analysis/")
+```
+
+## Setup
+
+Creating the dds object:
+
+```{r}
+# read in count data
+count.data <- read.table("data/featurecounts/counts.txt", header=T)
+
+column_names <- gsub("X.scratch.twinkle1.rnaSeq_STAR_output.", "", colnames(count.data))
+column_names <- gsub("_trimmed_1P.fq.gz_Aligned.sortedByCoord.out.bam", "", column_names)
+
+colnames(count.data) <- column_names
+
+rownames(count.data) <- count.data[,1]
+counts.in <- count.data[,7:ncol(count.data)]
+
+# create design matrix and subset:
+species <- c(rep("hypochondriacus", 6), 
+             rep("caudatus", 3), 
+             rep("hypochondriacus", 9), 
+             rep("caudatus", 5), 
+             rep("hypochondriacus", 3))
+
+counts.in <- counts.in[,species == "hypochondriacus"]
+ind <- paste0("AM00", gsub("_.*", "", gsub(".*_00", "", colnames(counts.in))))
+batch <- gsub("_.*", "", colnames(counts.in))
+seed_color <- c(rep("dark", 3),
+                rep("white", 3),
+                rep("pink", 3),
+                rep("dark", 4),
+                rep("white", 2),
+                rep("dark", 3),
+                rep("white", 2),
+                rep("dark", 3),
+                rep("white", 3))
+seed_color <- seed_color[species == "hypochondriacus"]
+
+ind <- as.factor(ind)
+batch <- as.factor(batch)
+seed_color <- as.factor(seed_color)
+
+# create desing matrix
+design.matrix <- data.frame(ind, batch, seed_color)
+rownames(design.matrix) <- colnames(counts.in)
+
+# add additional column with different encoding for individuals
+design.matrix$indn <- c(rep(1,3),
+              rep(1,3),
+              rep(1,4),
+              rep(1,2),
+              rep(2,3),
+              rep(2,3))
+design.matrix$indn <- as.factor(design.matrix$indn)
+
+# delete this later, check for what happens when the 587 sample is excluded due to the low number of reads
+#design.matrix <- design.matrix[-c(17:18),]
+#design.matrix <- droplevels(design.matrix)
+#counts.in <- counts.in[,-c(17:18)]
+
+# delete this later, plot PCA with complete sample names
+sample.names <- gsub("_WDH", "", sub("_", "", colnames(counts.in)))
+design.matrix$sample.names <- sample.names
+
+# create deseq2 object
+dds <- DESeqDataSetFromMatrix(countData = counts.in, colData = design.matrix, design = ~ seed_color + batch)
+row.names(dds) <- row.names(counts.in)
+  
+# followed the instructions from bioconductor vignette
+# first do pre filtering to only keep rows with at least 30 reads total
+keep <- rowSums(counts(dds) >= 10) >= 3
+summary(keep)
+dds <- dds[keep,]
+
+```
+
+
+
+Perform the differential expression analysis. Contrast the white against the dark seeds. Shrink LFC using the apeglm method, testing for significance using a LFC threshold of 1, as well as an adjusted FSOS rate of < 0.005.
+
+```{r}
+# do the differential expression analysis
+dds <- DESeq(dds)
+res <- results(dds,
+               contrast = c("seed_color","white","dark"),
+               alpha = 0.01)
+
+res.shrunk <- lfcShrink(dds, 
+                        res=res, 
+                        coef = "seed_color_white_vs_dark",
+                        lfcThreshold = 1,
+                        svalue = F,
+                        type = "apeglm")
+summary(res.shrunk, alpha=0.005)
+```
+
+
+## Sanity check and QC
+
+Sample level QC. The rlog function performs the regularized-logarithm transformation of the data, which corrects for noise inherent to the Poisson distribution for genes with small count values while not differing much from a log2 ttransformation for large count genes. Plot a PCA using the normalized counts:
+
+```{r, echo=FALSE}
+# use regularized-logarithm transformation
+# blind=T to keep the experimental design from influencing the results 
+rld <- rlog(dds, blind=T)
+
+# plot the PCA
+# ntop specifies the usage of the top x variable genes
+plotCustomPCA <- function (object, intgroup = "condition", shapegroup = "", ntop = 500, returnData = F) {
+    rv <- rowVars(assay(object))
+    select <- order(rv, decreasing = TRUE)[seq_len(min(ntop, 
+        length(rv)))]
+    pca <- prcomp(t(assay(object)[select, ]))
+    percentVar <- pca$sdev^2/sum(pca$sdev^2)
+    ob_data <- colData(object)
+    d <- data.frame(PC1 = pca$x[, 1], PC2 = pca$x[, 2], group = ob_data[,intgroup], shape = ob_data[,shapegroup], name = colnames(object))
+    d <- droplevels(d)
+    if (returnData) {
+        attr(d, "percentVar") <- percentVar[1:2]
+        return(d)
+    }
+    ggplot(data = d, aes_string(x = "PC1", y = "PC2", color = "group", shape="shape")) + 
+        geom_point(size = 6) + xlab(paste0("PC1: ", round(percentVar[1] * 
+        100), "% variance")) + ylab(paste0("PC2: ", round(percentVar[2] * 
+        100), "% variance")) + coord_fixed()
+}
+
+pca <- plotCustomPCA(rld, intgroup = "seed_color", shapegroup = "ind", ntop=nrow(res.shrunk)) +
+  geom_text_repel(aes(label = design.matrix$sample.names), 
+                  size=6, 
+                  color="black") +
+  scale_color_manual(values =  c("darkred","#F0B327")) +
+  scale_shape_manual(values = c(15,16,17,18)) +
+  labs(color = "Seed color") +
+  theme_bw() +
+  theme(text=element_text(size=24),
+        legend.position = "none")
+pca
+ggsave(filename = "plots/seed_pca_color.png", width=8, height=5)
+
+plotCustomPCA(rld, intgroup = "batch", shapegroup = "ind", ntop=15000) +
+  geom_text_repel(aes(label = design.matrix$sample.names), size=4.0) +
+  scale_color_manual(values =  wes_palette("Darjeeling1")) +
+  scale_shape_manual(values = c(15,16,17,18)) +
+  labs(color = "Seed color") +
+  theme_bw() +
+  theme(text=element_text(size=24),
+        legend.position = "none")
+
+ggsave(filename = "plots/seed_pca_batch.png", width=8, height=5)
+```
+
+DESeq2 needs to account for the relationship between variance and mean since RNAseq data is not homoscedastic. Since variance correlates with gene expression level, instead dispersion is used, which accounts for the gene variance and mean expression level (https://hbctraining.github.io/DGE_workshop_salmon_online/lessons/04b_DGE_DESeq2_analysis.html). DESeq2 shrinks the gene-wise dispersion estimates towards a curve fitted to the dispersion estimates, except for those with those genes with an extremely high value. These genes might not follow the modeling assumptions and have higher variability for non biological reasons. The following plot shows the relationship of dispersion black and mean and the shrunken dispersion values for genes with a certain number of counts. Blue circled genes represent outliers and are not shrunken.
+
+```{r}
+plotDispEsts(dds)
+```
+
+## LFC shrinkage comparison
+
+DESeq2 includes functions to shrink the LFC estimate if information for a gene is low (e.g. low counts or high dispersion values). The following plots show the LFC against the mean of normalized counts for a gene, unshrunken and shrunken.
+
+```{r}
+# plot LFC on mean of normalized counts, unshrunken values
+plotMA(res, ylim=c(-10,10), main="LFC against mean of normalized counts")
+# plot LFC on mean of normalized counts, shrunken values
+plotMA(res.shrunk, ylim=c(-10,10), main="Shrunken LFC")
+```
+
+The set of differentially expressed genes can be subset from the LFC shrunken results object.
+
+```{r}
+# load object with names of all betalain and flavonoid genes
+pathway_genes <- read.csv(file = "data/import/Betalain_Flavonoid_table.csv", header=F)
+colnames(pathway_genes) <- c("pathway_gene", "pathway", "gene_id")
+
+# subset expression data based on the pathway gene names
+df.shrunk <- as.data.frame(res.shrunk)
+pathway_expression <- df.shrunk[rownames(df.shrunk) %in% pathway_genes$gene_id,]
+pathway_expression$gene_id <- rownames(pathway_expression)
+# join the two tables and add a column indicating significantly different expression
+pathway_expression <- left_join(pathway_genes, pathway_expression)
+pathway_expression <- pathway_expression %>%
+  mutate(significant = ifelse(log2FoldChange > 1 & svalue < 0.005, "white", ifelse(log2FoldChange < -1 & svalue < 0.005, "dark", "no")))
+pathway_expression <- pathway_expression %>%
+  select(-lfcSE)
+
+na.omit(pathway_expression[pathway_expression$significant == "dark",])
+na.omit(pathway_expression[pathway_expression$significant == "white",])
+
+# load object with names of all identified MYB genes and their subgroup assignments
+myb_genes <- read.csv(file = "data/import/MYB_subgroup_assignment.csv")
+colnames(myb_genes) <- c("transcript_id", "subfamily", "gene_id", "subgroup")
+
+myb_expression <- df.shrunk[rownames(df.shrunk) %in% myb_genes$gene_id,]
+myb_expression$gene_id <- rownames(myb_expression)
+
+myb_expression <- left_join(myb_genes, myb_expression)
+myb_expression <- myb_expression %>%
+  mutate(significant = ifelse(log2FoldChange > 1 & svalue < 0.005, "white", ifelse(log2FoldChange < -1 & svalue < 0.005, "dark", "no")))
+myb_expression <- myb_expression %>%
+  select(-c(lfcSE,transcript_id)) %>%
+  unique()
+myb_expression <- myb_expression[, c(2,1,3,4,5,6,7)]
+
+na.omit(myb_expression[myb_expression$significant == "dark",])
+na.omit(myb_expression[myb_expression$significant == "white",])
+```
+
+Calculate TPM for the annotated genes from the count matrix to compare expression between different genes.
+
+```{r}
+# use the same code as for the GO-term analysis to extract the gene length:
+# create named vector specifying the gene length
+raw_lengths <- read.table("/home/tom/Documents/projects/A_hypochondriacus_reannotation/polished_genome_annotation/annotation/Ahypochondriacus_2.2_polished_corrected.cds.fasta.fai")
+raw_lengths <- raw_lengths[,1:2]
+colnames(raw_lengths) <- c("transcript_id", "length")
+raw_lengths <- raw_lengths %>%
+  mutate(gene_id = gsub("\\..*", "", transcript_id))
+raw_lengths <- raw_lengths %>%
+  group_by(gene_id) %>%
+  summarize(mean_length = median(length))
+# construct vector, subset for expressed genes
+gene.length <- raw_lengths$mean_length
+names(gene.length) <- raw_lengths$gene_id
+gene.length <- gene.length[names(gene.length) %in% rownames(res.shrunk)]
+
+# based on https://support.bioconductor.org/p/91218/#91256
+counts_expressed <- counts.in[rownames(counts.in) %in% rownames(res.shrunk),]
+x <- counts_expressed/ gene.length
+tpm.mat <- t(t(x)*1e6/colSums(x))
+# mean tpm for each gene
+tpm.mean <- apply(tpm.mat, 1, mean)
+
+
+# add tpm column to the MYB expression table
+myb.tpm <- c()
+for (i in 1:length(myb_expression$gene_id)){
+  if (myb_expression$gene_id[i] %in% names(tpm.mean)){
+    myb.tpm[i] <- tpm.mean[myb_expression$gene_id[i] == names(tpm.mean)]
+  } else {
+    myb.tpm[i] <- NA
+  }
+}
+myb_expression$baseMean <- myb.tpm
+colnames(myb_expression)[4] <- "meanTPM"
+
+# save as csv for import into other tools
+write_csv(myb_expression, file = "data/differential_expression_analysis/myb_expression.csv")
+
+# add tpm to pathway expression table
+pathway.tpm <- c()
+for (i in 1:length(pathway_expression$gene_id)){
+  if (pathway_expression$gene_id[i] %in% names(tpm.mean)){
+    pathway.tpm[i] <- tpm.mean[pathway_expression$gene_id[i] == names(tpm.mean)]
+  } else {
+    pathway.tpm[i] <- NA
+  }
+}
+pathway_expression$baseMean <- pathway.tpm
+colnames(pathway_expression)[4] <- "meanTPM"
+
+write.csv(pathway_expression, 
+          file="data/differential_expression_analysis/pathway_expression.csv",
+          quote = F,
+          row.names = F)
+```
+
+
+Individual genes can be found by gene name in the normalized count matrix of the differential expression analysis object.
+
+```{r}
+# create count matrix from dds object, using normalized count data
+normalized_counts <- counts(dds, normalized=T)
+
+# plot AmMYBl1 counts
+# prepare data
+AmMYBl1_counts <- data.frame(names(counts(dds, normalized=T)[rownames(counts(dds, normalized=T)) == "AHp014591",]), 
+                             counts(dds, normalized=T)[rownames(counts(dds, normalized=T)) == "AHp014591",])
+colnames(AmMYBl1_counts) <- c("replicate", "normalized_counts")
+AmMYBl1_counts$seed_color <- design.matrix$seed_color
+AmMYBl1_counts$sample <- design.matrix$ind
+
+# plot counts
+ggplot(data=AmMYBl1_counts) +
+  geom_violin(aes(x = seed_color, 
+                  y=normalized_counts, 
+                  fill = seed_color)) +
+  theme_classic() +
+  geom_point(aes(x=seed_color, 
+                 y=normalized_counts, shape=sample), 
+             position = position_dodge(width=0.15), 
+             size=4) +
+  scale_fill_manual(values = c("darkred","#F0B327"), guide = "none") +
+  scale_shape_discrete(guide = guide_legend(override.aes = list(size=3),
+                                            nrow = 2)) +
+  scale_y_log10() +
+  labs(y= "Normalized read pairs", 
+       x="Seed color",
+       shape = "") +
+  theme(text = element_text(size=19),
+        legend.position = c("bottom"))
+
+ggsave("plots/AmMYBl1_counts.png", height = 6, width = 7)
+```
+
+Create an volcano plot of the log fold change along with the p-values.
+
+```{r}
+# prepare the results dataframes:
+res.df <- as.data.frame(res)
+res.shrunk.df <- as.data.frame(res.shrunk)
+
+# add differential expression indicator
+res.shrunk.df$diffexpressed <- "-"
+res.shrunk.df$diffexpressed[res.shrunk.df$log2FoldChange > 1 & res.shrunk.df$svalue < 0.01] <- "white (12%)"
+res.shrunk.df$diffexpressed[res.shrunk.df$log2FoldChange < -1 & res.shrunk.df$svalue < 0.01] <- "dark (13%)"
+#res.shrunk.df[which(res.shrunk.df[,"svalue"] == 0), "svalue"] <- .Machine$double.xmin
+
+# lfc shrinkage
+volcano <- ggplot(data=res.shrunk.df) +
+  geom_point(aes(x=log2FoldChange, y=-log10(svalue), col=diffexpressed)) +
+  ylim(0,50) +
+  xlim(-12,12) +
+  theme_classic() +
+  scale_color_manual(values = c("black","darkred","#F0B327")) +
+  labs(color = "Expression higher in", 
+       y = "-log10(FSOS rate)",
+       x = "log2(fold change)") +
+  theme(text = element_text(size=24),
+        legend.position = "none")
+volcano
+
+ggsave(filename = "plots/volcano_after_shrinkage.png", width=8, height=5)
+
+plot_grid(pca, volcano,
+          nrow = 2,
+          labels = c("A","B"),
+          label_size = 22)
+
+ggsave(filename = "plots/dea_combined.png", width=10, height=13)
+```
+
+
+Use the deseq2 results in order to do a go-term analysis. Start with preparing the input data:
+
+```{r}
+# create named vector of all expressed genes, indicating which genes are differentially expressed
+sig <- res.shrunk[which(res.shrunk$svalue < 0.005 & abs(res.shrunk$log2FoldChange) > 1),]
+all.genes <- as.integer(rownames(dds) %in% rownames(sig))
+names(all.genes) <- rownames(res.shrunk)
+
+# create named vector specifying the gene length
+raw_lengths <- read.table("/home/tom/Documents/projects/A_hypochondriacus_reannotation/polished_genome_annotation/annotation/Ahypochondriacus_2.2_polished_corrected.cds.fasta.fai")
+raw_lengths <- raw_lengths[,1:2]
+colnames(raw_lengths) <- c("transcript_id", "length")
+raw_lengths <- raw_lengths %>%
+  mutate(gene_id = gsub("\\..*", "", transcript_id))
+raw_lengths <- raw_lengths %>%
+  group_by(gene_id) %>%
+  summarize(mean_length = median(length))
+# construct vector, subset for expressed genes
+gene.length <- raw_lengths$mean_length
+names(gene.length) <- raw_lengths$gene_id
+gene.length <- gene.length[names(gene.length) %in% rownames(res.shrunk)]
+
+# create object with the mappings between gene names and GO-terms
+#annotation.raw <- read.table("/home/tom/Documents/master_thesis/data/functional_annotation/eggnog_mapper/MM_8wexw920.emapper.annotations.tsv",
+#                             sep = "\t", comment.char = "#", fill=T)
+# works correctly if eggNOG columns are written to a new file before loading them in
+annotation.raw <- read_table("data/functional_annotation/egg_nog_mapper_go_terms.txt", col_names = F, comment = "#")
+#annotation.raw <- select(annotation.raw, V1, V0)
+colnames(annotation.raw) <- c("transcript_id", "go_terms")
+#annotation.raw <- annotation.raw[grep("GO", annotation.raw$go_terms),]
+annotation.raw <- annotation.raw %>%
+  mutate(gene_id = gsub("\\..*", "", transcript_id))
+
+go_terms <- strsplit(annotation.raw$go_terms,"\\,")
+names(go_terms) <- annotation.raw$gene_id
+# concatenate all entries with the same name:
+annotation.go <- split(unlist(go_terms, use.names = FALSE), rep(names(go_terms), lengths(go_terms)))
+
+# remove all entries with unannotated go terms
+annotation.go <- lapply(annotation.go, function(features, bad_features){
+  return(features[!features %in% bad_features])
+}, bad_features = "-")
+annotation.go <- annotation.go[lapply(annotation.go, length)>0]
+# remove all entries not in the expressed genes
+#sig <- res.shrunk[which(res.shrunk$padj < 0.01 & abs(res.shrunk$log2FoldChange) > 1),]
+annotation.go <- annotation.go[names(annotation.go) %in% rownames(res.shrunk)]
+# remove any duplicated elements in the named list that were created by concatenating transcripts
+annotation.go <- sapply(annotation.go, unique)
+```
+
+Perform the GO-term analysis. I talked with Akanksha: In general, it makes most sense to use both the up- and downregulated genes 
+
+```{r}
+# start by fitting probability weighting function
+pwf <- nullp(all.genes, bias.data = gene.length)
+
+# wallenius approximation using go seq
+GO.wall <- goseq(pwf = pwf, gene2cat = annotation.go)
+
+# significant overrepresented:
+# calculate FDR for overrepresented GO-terms, remove obsolete GO-terms
+significant_GOs <- GO.wall %>%
+  mutate(or_fdr = p.adjust(GO.wall$over_represented_pvalue, method="BH")) %>%
+  filter(or_fdr < 0.05) %>%
+  filter(term != "<NA>")
+significant_GOs$term_short <- ifelse(nchar(significant_GOs$term) > 50, paste0(strtrim(significant_GOs$term, 45), "..."), significant_GOs$term)
+
+significant_GOs$category <- as.factor(significant_GOs$category)
+significant_GOs <- significant_GOs %>%
+  arrange(or_fdr) %>%
+  mutate(category = factor(category, levels = category))
+
+# plot all three categories seperately:
+# only BP
+bp <- ggplot(data=significant_GOs %>% filter(ontology == "BP")) +
+  geom_col(aes(y=reorder(category, -or_fdr), x=numDEInCat, fill=or_fdr)) +
+  scale_y_discrete(labels = rev(significant_GOs[significant_GOs$ontology == "BP",]$term_short)) +
+  theme_classic() +
+  scale_fill_gradient(low="red2", high ="darkblue", limits=c(0,0.05)) +
+  labs(fill="False discory rate", x="Number DE-genes in category") +
+  theme(text = element_text(size=20),
+        axis.title.y = element_blank(),
+        plot.title.position = "plot")
+bp
+ggsave(filename = "plots/BP_go_plot.png", width=9, height=5)
+
+# only MF
+mf <- ggplot(data=significant_GOs %>% filter(ontology == "MF")) +
+  geom_col(aes(y=reorder(category, -or_fdr), x=numDEInCat, fill=or_fdr)) +
+  scale_y_discrete(labels = rev(significant_GOs[significant_GOs$ontology == "MF",]$term_short)) +
+  theme_classic() +
+  scale_fill_gradient(low="red2", high ="darkblue", limits=c(0,0.05)) +
+  labs(fill="False discory rate", x="Number DE-genes in category") +
+  theme(text = element_text(size=20),
+        axis.title.y = element_blank(),
+        plot.title.position = "plot")
+mf
+ggsave(filename = "plots/MF_go_plot.png", width=9, height=5)
+
+# only CC
+cc <- ggplot(data=significant_GOs %>% filter(ontology == "CC")) +
+  geom_col(aes(y=reorder(category, -or_fdr), x=numDEInCat, fill=or_fdr)) +
+  scale_y_discrete(labels = rev(significant_GOs[significant_GOs$ontology == "CC",]$term_short)) +
+  theme_classic() +
+  scale_fill_gradient(low="red2", high ="darkblue", limits=c(0,0.05)) +
+  labs(fill="False discory rate", x="Number DE-genes in category") +
+  theme(text = element_text(size=20),
+        axis.title.y = element_blank(),
+        plot.title.position = "plot")
+cc
+ggsave(filename = "plots/CC_go_plot.png", width=9, height=5)
+
+plot_grid(bp, cc, mf, 
+          nrow = 3,
+          labels = c("A","B","C"),
+          label_size = 22,
+          align = "v")
+ggsave(filename = "plots/all_go_terms.png", width=9, height=15)
+# export results
+write.table(significant_GOs %>% summarize(GO_term = category, 
+                                          ontology=ontology, 
+                                          OR_fdr = or_fdr, 
+                                          term = term, 
+                                          numDEInCat=numDEInCat,
+                                          numInCat=numInCat), 
+            file = "data/differential_expression_analysis/go_term_export.txt", 
+            quote = F, 
+            row.names = F,
+            col.names = T,
+            sep = "\t")
+```

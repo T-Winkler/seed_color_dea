@@ -1,0 +1,166 @@
+---
+title: "Master_thesis_plotting"
+author: "twinkle1"
+date: '2022-08-03'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(data.table)
+library(wesanderson)
+library(ggtranscript)
+library(cowplot)
+knitr::opts_knit$set(root.dir = "/home/tom/Documents/projects/A_hypochondriacus_reannotation/")
+```
+
+Setup:
+
+```{r}
+# set up function for reading in a gtf file
+read.gtf <- function(file){
+  # based on: https://www.biostars.org/p/272889/
+  # read in the gtf file:
+  gff <- fread(file)
+  setnames(gff, names(gff), c("chr","source","type","start","end","score","strand","phase","attributes"))
+  # subset attribute column into the gene and transcript id columns
+  # function for extracting the two attributes
+  extract_attributes <- function(gtf_column, att_of_interest){
+    att <- strsplit(gtf_column, "; ")
+    att <- gsub("\"","",unlist(att))
+    att <- gsub(";","",unlist(att))
+    if(!is.null(unlist(strsplit(att[grep(att_of_interest, att)], " ")))){
+      return( unlist(strsplit(att[grep(att_of_interest, att)], " "))[2])
+    }else{
+      return(NA)
+    }
+  }
+  # using the function to subset gene and transcript id:
+  gff$gene_id <- unlist(lapply(gff$attributes, extract_attributes, "gene"))
+  gff$transcript_id <- unlist(lapply(gff$attributes, extract_attributes, "transcript"))
+  return(gff)
+}
+
+# Create function for converting gtf dataframe to genomic ranges onbject
+Granges_from_gtf <- function(gtf){
+  # requires the GRanges and tidyverse packages
+  gene_structures <- gtf %>%
+  group_by(transcript_id) %>% # group by transcript id
+  summarise(gene_start = min(start),
+            gene_end = max(end),
+            seqnames = unique(chr), # all sequences should be on the same chromosome
+            gene_strand = unique(strand))
+  # use the gene_structures object to create the genomic ranges object
+  gene_ranges <- GRanges(seqnames = gene_structures$seqnames, 
+                         ranges = IRanges(start=gene_structures$gene_start, 
+                                          end=gene_structures$gene_end,
+                                          names = gene_structures$transcript_id), 
+                         strand = gene_structures$gene_strand)
+  return(gene_ranges)
+}
+```
+
+Main:
+Load annotations and compute simple summary statistics for comparison with other amaranth reference genomes.
+
+
+```{r}
+# read in old annotation
+old_annotation <- read.gtf("/home/tom/Documents/reference_genomes/Ahypochondriacus/annotation/Ahypochondriacus_459_v2.1.gene.underscore.gtf")
+
+# read in new annotation
+new_annotation <- read.gtf("polished_genome_annotation/annotation/Ahypochondriacus_2.2_polished_corrected.gtf")
+
+# calculate different summary statistics for the new annotation
+# mean exon length (even though there is only CDS included not UTRs)
+exon_length <- new_annotation %>%
+  filter(type == "CDS") %>%
+  summarize(chr=chr, transcript_id=transcript_id, length = (end - start)+1)
+mean(exon_length$length)
+
+# mean number of exons
+exon_count <- new_annotation %>%
+  filter(type == "CDS") %>%
+  group_by(transcript_id) %>%
+  summarise(exon_count = n())
+mean(exon_count$exon_count)
+
+# mean cds length
+cds_length <- new_annotation %>%
+  filter(type == "CDS") %>%
+  mutate(length = (end-start)+1) %>%
+  group_by(transcript_id) %>%
+  summarize(cds_sum = sum(length))
+mean(cds_length$cds_sum)
+```
+
+
+Plot the two AmMYBl1 annotations 
+
+
+```{r}
+# read in the versions from the different annotations
+AmMYBl1_old <- old_annotation[old_annotation$gene_id == "AH014566.v2.1",]
+AmMYBl1_new <- new_annotation[new_annotation$gene_id == "AHp014591",]
+
+# combine into one dataframe
+combined_AmMYBl1 <- rbind(AmMYBl1_old, AmMYBl1_new)
+
+# filter exons, calculate relative position of exons in the respective transcripts
+combined_AmMYBl1 <- combined_AmMYBl1 %>%
+  filter(type == "CDS") %>%
+  group_by(transcript_id) %>%
+  summarize(end = end - (min(start)-1),
+         start = start-(min(start)-1),
+         type = type,
+         transcript_id = transcript_id,
+         strand=strand)
+# manually add transposable element 
+combined_AmMYBl1[7,] <- combined_AmMYBl1[1,]
+combined_AmMYBl1[7,1] <- "AHp014591.1"
+combined_AmMYBl1[7,2] <- 14713711 - (AmMYBl1_new[[1,4]]-1)
+combined_AmMYBl1[7,3] <- 14713328 - (AmMYBl1_new[[1,4]]-1)
+combined_AmMYBl1[7,4] <- "TE"
+combined_AmMYBl1[7,5] <- "+"
+# adjust type for the old annotation, just for coloration in the plot
+combined_AmMYBl1[1:2,4] <- "CDS1"
+# adjust factor levels for order in the plot
+combined_AmMYBl1$transcript_id <- relevel(as.factor(combined_AmMYBl1$transcript_id), "AHp014591.1")
+
+# plot the annotation comparison for AmMYBl1
+ggplot(data=combined_AmMYBl1) +
+  geom_range(aes(xstart=start, xend=end, y=transcript_id, fill=type)) +
+  geom_intron(data = to_intron(combined_AmMYBl1, "transcript_id")[-3,],
+              aes(xstart=start, xend=end, y=transcript_id,strand=strand)) +
+  labs(y="", x="Relative position", fill="") +
+  scale_fill_manual(values = wes_palette("Darjeeling1"),
+                    labels = c("v2.2", "v2.1", "repetitive element")) +
+  scale_y_discrete(labels=c("AmMYBl1 v2.2", "AmMYBl1 v2.1")) +
+  theme_classic() +
+  theme(text = element_text(size=22),
+        legend.position = "bottom",
+        plot.margin = margin(10,100,10,10),
+        axis.text.y = element_text(size=20),
+        axis.text.x = element_text(angle = 45, 
+                                   size = 20, 
+                                   vjust = 1, 
+                                   hjust = 1))
+
+# save plot
+ggsave(filename = "plots/AmMYBl1_annotation_comp.png", width=10, height=5)
+
+# command used to extract the information: awk '{if ($1 == "Scaffold_9" && $4 > 14713290 && $5 < 14713712) {print}}' projects/A_hypochondriacus_reannotation/data/repeatmasking/repeatmasker/Ahypochondriacus_2.2_polished.capital.fasta.out.gff
+```
+
+
+
+
+
+
+
+
+
+
+
+
